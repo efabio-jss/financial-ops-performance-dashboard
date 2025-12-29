@@ -1,0 +1,172 @@
+// Weighted average margin (%) by transaction amountAvg Margin % (weighted) = 
+VAR _weightedSum =
+    SUMX (
+        Transactions,
+        LOOKUPVALUE (
+            Products[AvgMarginPct],
+            Products[ProductID], Transactions[ProductID]
+        ) * Transactions[Amount]
+    )
+VAR _totalAmount = SUM ( Transactions[Amount] )
+RETURN
+DIVIDE ( _weightedSum, _totalAmount ) / 100
+
+Active Clients = 
+CALCULATE (
+    DISTINCTCOUNT ( Clients[ClientID] ),
+    TREATAS ( VALUES ( Transactions[ClientID] ), Clients[ClientID] ) // align client IDs across tables
+)
+
+Avg Resolution Hours = 
+AVERAGEX(
+    FILTER(Support_Tickets, NOT ISBLANK(Support_Tickets[ResolutionTimeHours])),
+    Support_Tickets[ResolutionTimeHours]
+)// Average resolution time (hours), ignoring blanks/unresolved  // exclude open/no-duration
+
+Avg Risk Rating (numeric) = 
+AVERAGEX (
+    VALUES ( Clients[RiskRating] ),
+    SWITCH (
+        TRUE(),
+        Clients[RiskRating] = "AAA", 1,
+        Clients[RiskRating] = "AA",  2,
+        Clients[RiskRating] = "A",   3,
+        Clients[RiskRating] = "BBB", 4,
+        Clients[RiskRating] = "BB",  5,
+        Clients[RiskRating] = "B",   6,
+        Clients[RiskRating] = "CCC", 7,
+        BLANK()
+    )
+)
+
+Avg Transaction Value = DIVIDE([Total Amount], [Transactions Count])// Average transaction ticket size // avoids divide-by-zero
+
+Critical Tickets % = 
+DIVIDE(
+    CALCULATE([Tickets Count], Support_Tickets[Priority] = "Critical"),
+    [Tickets Count]
+)// % of tickets marked as Critical priority
+
+Distinct Clients = DISTINCTCOUNT(Transactions[ClientID])// Distinct count of clients present in Transactions // unique clients transacting
+
+KPI Tooltip = 
+"Tx: " & FORMAT([Transactions Count], "#,0")
+& " | Clients: " & FORMAT([Distinct Clients], "#,0")
+& " | MoM: " & FORMAT([MoM Amount % (Card)], "0.0%")
+& " | SLA: " & FORMAT([SLA Compliance %], "0.0%")
+// Compact KPI tooltip for executive visuals
+
+MoM Amount % (Card) = 
+VAR LastDataDate =
+    CALCULATE(
+        MAX ( 'Date'[Date] ),
+        FILTER( ALL ( 'Date' ), CALCULATE( [Total Amount] ) <> BLANK() ) // última data com valor
+    )
+VAR CurrStart = DATE ( YEAR ( LastDataDate ), MONTH ( LastDataDate ), 1 )
+VAR CurrEnd   = EOMONTH ( LastDataDate, 0 )
+VAR PrevStart = EDATE ( CurrStart, -1 )
+VAR PrevEnd   = EOMONTH ( PrevStart, 0 )
+VAR CurrAmt =
+    CALCULATE ( [Total Amount], DATESBETWEEN ( 'Date'[Date], CurrStart, CurrEnd ) )
+VAR PrevAmt =
+    CALCULATE ( [Total Amount], DATESBETWEEN ( 'Date'[Date], PrevStart, PrevEnd ) )
+RETURN
+DIVIDE ( CurrAmt - PrevAmt, PrevAmt )
+
+Net Revenue = SUM(Transactions[NetAmount])// net amount = Amount - Fee
+
+Net Revenue YTD = TOTALYTD([Net Revenue], 'Date'[Date])// Year-to-Date net revenue (calendar YTD) // accumulates from Jan 1 to current date context
+
+Res vs Target Delta = 
+[Avg Resolution Hours] - [SLA Target Hours]// Difference between actual average resolution time and the SLA target (in hours).
+// > 0  => above target (worse);  <= 0 => at/under target (better).
+
+Risk Rating Level = 
+SWITCH (
+    TRUE(),
+    [Avg Risk Rating (numeric)] <= 2, "Low Risk",
+    [Avg Risk Rating (numeric)] <= 4, "Medium Risk",
+    "High Risk"
+)// Converts the average numeric risk rating (AAA=1 … CCC=7) into a textual category.
+// Low Risk = 1–2 (AAA–AA), Medium Risk = 3–4 (A–BBB), High Risk = 5–7 (BB–CCC)
+
+SLA Breach % = 
+DIVIDE(
+    CALCULATE([Tickets Count], Support_Tickets[SLA_Breached] = "Yes"),
+    [Tickets Count]
+)// % of tickets that breached SLA (SLA_Breached = "Yes")
+
+SLA Breaches = 
+CALCULATE(
+    [Tickets Count],
+    Support_Tickets[SLA_Breached] = "Yes"
+)// Total number of SLA breaches (Yes)
+
+SLA Compliance % = 
+DIVIDE(
+    CALCULATE(
+        COUNTROWS(Support_Tickets),
+        KEEPFILTERS(Support_Tickets[SLA_Breached] = "No")
+    ),
+    COUNTROWS(Support_Tickets)
+)
+
+SLA Target Hours = 
+VAR days = SELECTEDVALUE(Departments[SLA_Target_Days])
+RETURN IF(ISBLANK(days), BLANK(), days * 24)// SLA target in hours for the current Department row (Days × 24)
+
+Tickets Closed = 
+CALCULATE([Tickets Count], Support_Tickets[Status] = "Closed")// Number of tickets with status = Closed
+
+Tickets Closed % = 
+DIVIDE([Tickets Closed], [Tickets Count])// % of tickets closed // SLA-adjacent effectiveness indicator
+
+Tickets Count = COUNTROWS(Support_Tickets)// Count of ticket rows // total tickets opened (in current filters)
+
+Total Amount = SUM(Transactions[Amount])// Sums of main financials // total gross amount of transactions
+
+Total Amount PY = 
+CALCULATE( [Total Amount], DATEADD('Date'[Date], -1, YEAR) )// Prior Year comparison (requires Date[Date] → Transactions[TransactionDate]) // shift context back 1 year
+
+Total Fees = SUM(Transactions[Fee])// total fees collected
+
+Transactions Count = COUNTROWS(Transactions)// Count of transaction rows // total number of transaction records
+
+Within Target % = 
+VAR _targetHrs = [SLA Target Hours]  // target (in hours) for the current department
+VAR _num =
+    CALCULATE(
+        COUNTROWS(Support_Tickets),
+        NOT ISBLANK(Support_Tickets[ResolutionTimeHours]),
+        Support_Tickets[ResolutionTimeHours] <= _targetHrs
+    )
+VAR _den =
+    CALCULATE(
+        COUNTROWS(Support_Tickets),
+        NOT ISBLANK(Support_Tickets[ResolutionTimeHours])
+    )
+RETURN
+DIVIDE(_num, _den)// % of tickets resolved within SLA target (department-level)
+
+Client_Scatter = 
+SUMMARIZECOLUMNS(
+    Clients[ClientID],
+    Clients[ClientName],
+    Clients[Segment],
+    "AvgRisk", [Avg Risk Rating (numeric)],      // medida escalar por cliente
+    "NetRevenue", [Net Revenue],                 // medida escalar por cliente
+    "TotalAmount", [Total Amount]                // medida escalar por cliente
+)
+
+Date = 
+ADDCOLUMNS (
+    CALENDAR ( DATE(2023,1,1), DATE(2025,12,31) ),
+    "Year", YEAR([Date]),
+    "MonthNo", MONTH([Date]),
+    "Month", FORMAT([Date], "MMM"),
+    "YearMonth", FORMAT([Date], "YYYY-MM"),
+    "Quarter", "Q" & FORMAT(QUARTER([Date]), "0")
+) 
+ // Create a proper calendar for time intelligence
+
+ 
